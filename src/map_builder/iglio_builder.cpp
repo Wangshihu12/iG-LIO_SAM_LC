@@ -2,6 +2,10 @@
 // #include <chrono>
 namespace lio
 {
+    // 计算损失函数
+    // e：误差项（通常是残差的平方）。
+    // delta：一个阈值参数。
+    // rho：一个 Eigen::Vector3d 向量，用于存储计算结果。rho[0] 是损失值，rho[1] 是损失函数对 e 的一阶导数，rho[2] 是二阶导数
     inline void CauchyLossFunction(const double e, const double delta, Eigen::Vector3d &rho)
     {
         double dsqr = delta * delta;
@@ -22,6 +26,7 @@ namespace lio
 
     IGLIOBuilder::IGLIOBuilder(IGLIOParams &params) : params_(params)
     {
+        // kf 初始化
         kf_ = std::make_shared<kf::IESKF>(params_.esikf_max_iteration);
         kf_->set_share_function(
             [this](kf::State &s, kf::SharedState &d)
@@ -30,6 +35,7 @@ namespace lio
         // 初始化IMUProcessor
         imu_processor_ = std::make_shared<IMUProcessor>(kf_);
         imu_processor_->setCov(params.imu_gyro_cov, params.imu_acc_cov, params.imu_gyro_bias_cov, params.imu_acc_bias_cov);
+        // 设置外参
         Eigen::Matrix3d rot_ext;
         Eigen::Vector3d pos_ext;
         rot_ext << params.imu_ext_rot[0], params.imu_ext_rot[1], params.imu_ext_rot[2],
@@ -41,6 +47,7 @@ namespace lio
 
         fast_voxel_map_ = std::make_shared<FastVoxelMap>(params.scan_resolution);
         voxel_map_ = std::make_shared<VoxelMap>(params.map_resolution, params.map_capacity, params.grid_capacity, params.mode);
+        // 预分配内存
         point_array_lidar_.reserve(params.max_points_per_scan);
         cache_flag_.reserve(params.max_points_per_scan);
         fastlio_cache_.reserve(params.max_points_per_scan);
@@ -57,6 +64,7 @@ namespace lio
         if (status == Status::INITIALIZE)
         {
             // 初始化VoxelMap
+            // 转换点云到世界坐标系，并添加到 voxel_map_
             cloud_world_ = transformToWorld(cloud_lidar_);
             voxel_map_->addCloud(cloud_world_);
             frame_count_++;
@@ -66,14 +74,17 @@ namespace lio
             status = Status::MAPPING;
             return;
         }
+        // 点云滤波
         fast_voxel_map_->filter(cloud_lidar_, point_array_lidar_);
         // auto tic = std::chrono::system_clock::now();
+        // 卡尔曼更新
         kf_->update();
         // auto toc = std::chrono::system_clock::now();
         // std::chrono::duration<double> duration = toc - tic;
         // std::cout << duration.count() * 1000 << std::endl;
 
         frame_count_++;
+        // 前 10 帧都认为是关键帧，加入 voxel_map_ 和关键帧位姿
         if (frame_count_ < 10)
         {
             cloud_world_ = transformToWorld(cloud_lidar_);
@@ -83,6 +94,7 @@ namespace lio
             return;
         }
 
+        // 关键帧判断
         if (cloud_lidar_->size() < 1000 || Sophus::SO3d(kf_->x().rot.transpose() * key_rot_).log().norm() > 0.18 || (kf_->x().pos - key_pos_).norm() > 0.5)
         {
             key_frame_count_++;
@@ -107,17 +119,23 @@ namespace lio
 
     void IGLIOBuilder::fastlioConstraint(kf::State &state, kf::SharedState &shared_state)
     {
+        // 滤波后的点云
         int size = point_array_lidar_.size();
         if (shared_state.iter_num < 3)
         {
             for (int i = 0; i < size; i++)
             {
+                // 遍历点云，转换到世界坐标系
                 Eigen::Vector3d p_lidar = point_array_lidar_[i].point;
                 Eigen::Vector3d p_body = state.rot_ext * p_lidar + state.pos_ext;
                 Eigen::Vector3d p_world = state.rot * p_body + state.pos;
+
                 std::vector<Eigen::Vector3d> nearest_points;
                 nearest_points.reserve(5);
+                // kNN 寻找最近点
                 voxel_map_->searchKNN(p_world, 5, 5.0, nearest_points);
+
+                // 拟合平面，cache_flag_ 表示决定是否缓存
                 Eigen::Vector4d pabcd;
                 cache_flag_[i] = false;
                 if (nearest_points.size() >= 3 && esti_plane(pabcd, nearest_points, 0.1, false))
@@ -137,6 +155,8 @@ namespace lio
                 }
             }
         }
+
+        // 计算雅可比矩阵 H b
         int effect_feat_num = 0;
         shared_state.H.setZero();
         shared_state.b.setZero();
@@ -168,9 +188,10 @@ namespace lio
             std::cout << "NO EFFECTIVE POINTS!" << std::endl;
     }
 
+    // 计算 GICP 约束
     void IGLIOBuilder::gicpConstraint(kf::State &state, kf::SharedState &shared_state)
     {
-        int size = point_array_lidar_.size();
+        int size = point_array_lidar_.size();   // 滤波后的点云
         if (shared_state.iter_num < 3)
         {
             gicp_cache_.clear();
@@ -178,10 +199,12 @@ namespace lio
             Eigen::Matrix3d cov_B = Eigen::Matrix3d::Zero();
             for (int i = 0; i < size; i++)
             {
+                // 遍历点云，转换到世界坐标系
                 Eigen::Vector3d p_lidar = point_array_lidar_[i].point;
                 Eigen::Vector3d p_world = state.rot * (state.rot_ext * p_lidar + state.pos_ext) + state.pos;
                 Eigen::Matrix3d cov_A = point_array_lidar_[i].cov;
 
+                // 搜索体素，存入 gicp_cache_
                 for (Eigen::Vector3d &r : voxel_map_->searchRange())
                 {
                     Eigen::Vector3d pw_near = p_world + r;
@@ -199,16 +222,22 @@ namespace lio
         for (int i = 0; i < gicp_cache_.size(); i++)
         {
             GICPCorrespond &gicp_corr = gicp_cache_[i];
+            // 计算点云的均值 mean_A 与目标均值 mean_B 之间的误差，并计算其加权误差（chi2_error）
             Eigen::Vector3d p_lidar = gicp_corr.meanA;
             Eigen::Vector3d p_body = state.rot_ext * p_lidar + state.pos_ext;
             Eigen::Vector3d mean_A = state.rot * p_body + state.pos;
             Eigen::Matrix3d omiga = (gicp_corr.covB + state.rot * state.rot_ext * gicp_corr.covA * state.rot_ext.transpose() * state.rot.transpose()).inverse();
             Eigen::Vector3d error = gicp_corr.meanB - mean_A;
             double chi2_error = error.transpose() * omiga * error;
+
             if (shared_state.iter_num > 2 && chi2_error > 7.815)
                 continue;
+
+            // 使用 CauchyLossFunction 来计算鲁棒权重，以降低离群点对结果的影响
             Eigen::Vector3d rho;
             CauchyLossFunction(chi2_error, 10.0, rho);
+
+            // 计算雅可比矩阵和 H b
             J.setZero();
             J.block<3, 3>(0, 0) = -Eigen::Matrix3d::Identity();
             J.block<3, 3>(0, 3) = state.rot * Sophus::SO3d::hat(p_body);
